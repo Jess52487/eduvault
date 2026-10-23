@@ -1,0 +1,67 @@
+export const dynamic = "force-dynamic";
+export const runtime = "nodejs";
+
+import { NextResponse } from "next/server";
+import { auditLog } from "@/lib/api/audit";
+import { requirePermission } from "@/lib/api/auth";
+import { withApiHardening } from "@/lib/api/hardening";
+import { getDb } from "@/lib/mongodb";
+import { invalidateCatalogCache } from "@/lib/cache/redis";
+import { enqueueMaterialSearchProjection } from "@/lib/backend/materialSearchProjection";
+import { acceptTransfer, cancelTransfer, declineTransfer } from "@/lib/ownership/ownershipTransfer";
+import { serializeTransfer } from "@/lib/ownership/transferApi";
+
+const ACTIONS = new Set(["accept", "decline", "cancel"]);
+
+// POST /api/ownership-transfers/[transferId]  { action: "accept" | "decline" | "cancel" }
+//   accept / decline: the named recipient only.
+//   cancel: the proposing owner, or an admin.
+export async function POST(request, { params }) {
+  return withApiHardening(
+    request,
+    { route: "ownership-transfers.action", rateLimit: { limit: 20, windowMs: 60_000 } },
+    async () => {
+      const authorization = await requirePermission(request, "creator:manage");
+      if (!authorization.ok) {
+        return NextResponse.json(
+          { error: authorization.status === 401 ? "Authentication required" : "Creator access required" },
+          { status: authorization.status }
+        );
+      }
+      const user = authorization.user;
+      const actorAddress = user.walletAddress || user.address;
+      if (!actorAddress) {
+        return NextResponse.json({ error: "No wallet address on account" }, { status: 400 });
+      }
+
+      const body = await request.json().catch(() => ({}));
+      if (!ACTIONS.has(body?.action)) {
+        return NextResponse.json({ error: 'action must be "accept", "decline" or "cancel".' }, { status: 400 });
+      }
+
+      const db = await getDb();
+      const transferId = params?.transferId;
+      let result;
+      if (body.action === "accept") {
+        result = await acceptTransfer(db, { transferId, actorAddress });
+      } else if (body.action === "decline") {
+        result = await declineTransfer(db, { transferId, actorAddress });
+      } else {
+        result = await cancelTransfer(db, { transferId, actorAddress, isAdmin: user.role === "admin" });
+      }
+
+      // Re-run side effects even on a replayed accept: they are idempotent and
+      // a previous attempt may have died before reaching them.
+      if (body.action === "accept" && (result.material || result.replayed)) {
+        const material = result.material || (await db.collection("materials").findOne({ _id: result.transfer.materialId }));
+        if (material) {
+          await enqueueMaterialSearchProjection({ db, material, reason: "material_ownership_transferred" });
+          await invalidateCatalogCache();
+        }
+      }
+
+      auditLog({ event: `ownership_transfer_${body.action}`, route: "ownership-transfers.action", method: "POST", status: 200, actor: user.sub, materialId: String(result.transfer.materialId) });
+      return NextResponse.json({ transfer: serializeTransfer(result.transfer), replayed: result.replayed });
+    }
+  );
+}

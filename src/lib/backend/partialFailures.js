@@ -15,6 +15,7 @@
 import { redactSensitiveDetails } from './operationalHealth.js';
 import { appendAuditRecord } from './auditLedger.js';
 import { COLLECTIONS } from './schemaContracts.js';
+import { sortRecords } from './sortContract.js';
 
 export const PARTIAL_FAILURE_DOMAINS = {
   ASYNC_JOBS: 'async_jobs',
@@ -27,6 +28,16 @@ export const PARTIAL_FAILURE_STATUSES = {
   RETRYING: 'retrying',
   RESOLVED: 'resolved',
   ABANDONED: 'abandoned',
+};
+
+// Open work first. Failures are merged from several collections, each fetched
+// newest-first on its own, so the merged list needs its own total order or
+// offset/limit pages can repeat or skip items between requests.
+const FAILURE_STATUS_PRECEDENCE = {
+  [PARTIAL_FAILURE_STATUSES.UNRESOLVED]: 0,
+  [PARTIAL_FAILURE_STATUSES.RETRYING]: 1,
+  [PARTIAL_FAILURE_STATUSES.ABANDONED]: 2,
+  [PARTIAL_FAILURE_STATUSES.RESOLVED]: 3,
 };
 
 export const SEVERITIES = {
@@ -384,6 +395,8 @@ export async function getPartialFailures(db, filter = {}) {
     }
     return true;
   });
+
+  filtered = sortRecords(filtered, { timestampField: 'updatedAt', statusPrecedence: FAILURE_STATUS_PRECEDENCE });
 
   // Calculate high-level operator summary metrics
   const total = filtered.length;
