@@ -2,7 +2,7 @@
 
 import Image from "next/image";
 import Link from "next/link";
-import { useState, useEffect } from "react";
+import { Suspense, useState, useEffect } from "react";
 import { FaBookOpen, FaListUl, FaStickyNote, FaImage, FaTag, FaCheckCircle } from "react-icons/fa";
 import { motion } from "framer-motion";
 import { useParams } from "next/navigation";
@@ -14,7 +14,7 @@ import Web3ErrorBoundary from "@/components/web3/Web3ErrorBoundary";
 import Navbar from "@/components/Navbar";
 import dynamic from "next/dynamic";
 import ResourceStatusBadge from "@/components/materials/ResourceStatusBadge";
-import MaterialReviewPanel from "@/components/materials/MaterialReviewPanel";
+import MaterialReviewPanel, { MaterialReviewPanelSkeleton } from "@/components/materials/MaterialReviewPanel";
 import { trackRecentlyViewed } from "@/hooks/useRecentlyViewed";
 import PreviewBlock from "./components/PreviewBlock";
 
@@ -81,8 +81,14 @@ export default function MaterialDetailsPage() {
   useEffect(() => {
     if (materialQuery.data) {
       trackRecentlyViewed(materialQuery.data);
+      fetch(`/api/materials/${id}/analytics`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ eventType: "view", dwellMs: 1000, interactionCount: 1 }),
+        keepalive: true,
+      }).catch(() => {});
     }
-  }, [materialQuery.data]);
+  }, [id, materialQuery.data]);
 
   return (
     <>
@@ -272,13 +278,15 @@ export default function MaterialDetailsPage() {
 
                     <RevisionHistoryPanel history={history || []} currentVersion={material.version} />
 
-                    <MaterialReviewPanel
-                      materialId={id}
-                      initialReviews={material.reviews || material.reviewHistory || []}
-                      entitlement={entitlementQuery}
-                      currentAddress={address}
-                      creatorAddress={material.userAddress || material.ownerAddress || material.creatorAddress || material.author?.walletAddress}
-                    />
+                    <Suspense fallback={<MaterialReviewPanelSkeleton />}>
+                      <MaterialReviewPanel
+                        materialId={id}
+                        initialReviews={material.reviews || material.reviewHistory || []}
+                        entitlement={entitlementQuery}
+                        currentAddress={address}
+                        creatorAddress={material.userAddress || material.ownerAddress || material.creatorAddress || material.author?.walletAddress}
+                      />
+                    </Suspense>
                   </div>
 
                   <div className="order-1 lg:order-2">

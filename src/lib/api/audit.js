@@ -1,3 +1,5 @@
+import { maskIdentifiersInText } from "../monitoring/logSafety.js";
+
 const SAFE_FIELDS = new Set([
   "event",
   "route",
@@ -20,6 +22,10 @@ const SAFE_FIELDS = new Set([
   "purchaseId",
   "correlationId",
   "policyVersion",
+  "role",
+  "material",
+  "version",
+  "purchase"
 ]);
 
 export function auditLog(fields) {
@@ -27,7 +33,12 @@ export function auditLog(fields) {
 
   for (const [key, value] of Object.entries(fields || {})) {
     if (SAFE_FIELDS.has(key) && value !== undefined && value !== null) {
-      entry[key] = String(value).slice(0, 300);
+      let stringValue = String(value);
+      stringValue = stringValue.replace(/(bearer\s+)[^\s]+/ig, '$1***');
+      stringValue = stringValue.replace(/(token=)[^\s&]+/ig, '$1***');
+      stringValue = stringValue.replace(/https?:\/\/[^\s]+/ig, '***');
+      // Wallets, emails and IPs become stable pseudonyms (#883).
+      entry[key] = maskIdentifiersInText(stringValue).slice(0, 300);
     }
   }
 

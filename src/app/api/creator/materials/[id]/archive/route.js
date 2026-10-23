@@ -3,31 +3,38 @@ export const runtime = "nodejs";
 
 import { NextResponse } from "next/server";
 import { ObjectId } from "mongodb";
-import { getUserFromCookie } from "@/lib/api/auth";
+import { requirePermission } from "@/lib/api/auth";
 import { withApiHardening } from "@/lib/api/hardening";
 import { getDb } from "@/lib/mongodb";
 import { auditLog } from "@/lib/api/audit";
 import { errorResponse } from "@/lib/utils/errorResponse";
-import { enqueueMaterialSearchProjection } from "@/lib/backend/materialSearchProjection";
+import { withFeatureGuard } from "@/lib/featureFlags";
+import {
+  enqueueMaterialSearchProjection,
+  enqueueMaterialSearchDeletion,
+} from "@/lib/backend/materialSearchProjection";
 
 function normalizeAddress(addr) {
   return String(addr || "").trim().toLowerCase();
 }
 
-export async function POST(request, context) {
+async function handleArchive(request, context) {
   return withApiHardening(
     request,
     { route: "creator-material-archive" },
     async () => {
-      const user = await getUserFromCookie(request);
-      if (!user) {
-        auditLog({ event: "auth_failed", route: "creator/materials/[id]/archive", method: "POST", status: 401 });
+      const authorization = await requirePermission(request, "creator:manage");
+      if (!authorization.ok) {
+        auditLog({ event: "auth_failed", route: "creator/materials/[id]/archive", method: "POST", status: authorization.status });
         return errorResponse({
-          status: 401,
-          detail: "Authentication required.",
+          status: authorization.status,
+          code: authorization.status === 401 ? "AUTH_UNAUTHENTICATED" : "AUTH_FORBIDDEN",
+          detail: authorization.status === 401 ? "Authentication required." : "Creator access required.",
           instance: "/api/creator/materials/[id]/archive",
+          request,
         });
       }
+      const user = authorization.user;
 
       const { params } = context || {};
       const resolvedParams = params ? await params : {};
@@ -36,8 +43,10 @@ export async function POST(request, context) {
       if (!id) {
         return errorResponse({
           status: 400,
+          code: "VALIDATION_FIELD",
           detail: "Missing material ID.",
           instance: "/api/creator/materials/[id]/archive",
+          request,
         });
       }
 
@@ -49,8 +58,10 @@ export async function POST(request, context) {
         if (!material) {
           return errorResponse({
             status: 404,
+            code: "NOT_FOUND",
             detail: "Material not found.",
             instance: `/api/creator/materials/${id}/archive`,
+            request,
           });
         }
 
@@ -71,8 +82,10 @@ export async function POST(request, context) {
           });
           return errorResponse({
             status: 403,
+            code: "AUTH_FORBIDDEN",
             detail: "Forbidden: only the material owner can archive or restore this resource.",
             instance: `/api/creator/materials/${id}/archive`,
+            request,
           });
         }
 
@@ -88,16 +101,30 @@ export async function POST(request, context) {
           updatedAt: now,
           updatedBy: userAddress,
           searchVersion: nextSearchVersion,
+          // Archived materials are not searchable; restored materials are indexable again.
+          searchVisibility: archived ? "hidden" : "public",
         };
 
         await db.collection("materials").updateOne(query, { $set: updateDoc });
         const updatedMaterial = { ...material, ...updateDoc };
-        await enqueueMaterialSearchProjection({
-          db,
-          material: updatedMaterial,
-          reason: archived ? "material_archived" : "material_restored",
-          now,
-        });
+
+        if (archived) {
+          // Remove the material from all search indexes so restricted records cannot
+          // leak through unauthorized queries.
+          await enqueueMaterialSearchDeletion({
+            db,
+            material: updatedMaterial,
+            reason: "material_archived",
+            now,
+          });
+        } else {
+          await enqueueMaterialSearchProjection({
+            db,
+            material: updatedMaterial,
+            reason: "material_restored",
+            now,
+          });
+        }
 
         auditLog({
           event: archived ? "material_archived" : "material_restored",
@@ -124,18 +151,19 @@ export async function POST(request, context) {
         });
         return errorResponse({
           status: 500,
+          code: "INTERNAL",
           detail: "Failed to update material archive state.",
           instance: `/api/creator/materials/${id}/archive`,
+          request,
         });
       }
     }
   );
 }
 
-export async function PUT(request, context) {
-  return POST(request, context);
-}
-
-export async function PATCH(request, context) {
-  return POST(request, context);
-}
+// Wrap all three HTTP methods with the ARCHIVE_MATERIAL feature guard.
+// When the flag is disabled (env var or DB override), every method responds
+// with 503 immediately without running any business logic.
+export const POST  = withFeatureGuard('ARCHIVE_MATERIAL', handleArchive);
+export const PUT   = withFeatureGuard('ARCHIVE_MATERIAL', handleArchive);
+export const PATCH = withFeatureGuard('ARCHIVE_MATERIAL', handleArchive);

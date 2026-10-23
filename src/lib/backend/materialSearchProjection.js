@@ -2,7 +2,7 @@ export const MATERIAL_SEARCH_COLLECTION = "material_search_documents";
 export const MATERIAL_SEARCH_TOMBSTONE_COLLECTION = "material_search_tombstones";
 export const MATERIAL_SEARCH_RECONCILIATION_COLLECTION = "material_search_reconciliation_audit";
 
-const RESTRICTED_MODERATION_STATUSES = new Set(["suspended", "removed", "rejected"]);
+const RESTRICTED_MODERATION_STATUSES = new Set(["suspended", "removed", "rejected", "pending_review"]);
 
 function normalizeId(value) {
   return String(value?._id ?? value?.materialId ?? value ?? "");
@@ -191,7 +191,7 @@ export async function applyMaterialSearchProjection(db, payload, { now = new Dat
   return { action: result.upsertedCount ? "inserted" : "updated", reason: null, materialId, version };
 }
 
-function diffForMaterial(material, projection) {
+export function diffForMaterial(material, projection) {
   const access = evaluateMaterialSearchAccess(material);
   const version = getMaterialSearchVersion(material);
   if (!access.searchable) {

@@ -18,11 +18,15 @@
     "build": "next build --webpack",
     "start": "next start",
     "lint": "eslint",
+    "typecheck": "echo 'Typecheck not applicable yet (JS codebase without checkJS)'",
     "test": "vitest",
-    "test:all": "npm run test:contracts && npm run test:backend",
+    "test:frontend": "vitest run",
+    "test:all": "npm run test:contracts && npm run test:backend && npm run test:frontend",
     "test:contracts": "hardhat test",
     "test:integration": "vitest run test/integration",
     "test:backend": "npx tsx --test tests/backend/*.test.mjs",
+    "test:fuzz": "npx tsx --test tests/backend/fuzz.test.mjs",
+    "test:concurrency": "vitest run test/concurrency",
     "audit:deps": "npm audit --audit-level=critical",
     "audit:deps:high": "npm audit --audit-level=high",
     "audit:deps:critical": "npm audit --audit-level=critical",
@@ -30,7 +34,14 @@
     "indexer:stellar": "node scripts/run-stellar-indexer.mjs",
     "clean:intents": "node scripts/clean-stale-intents.mjs",
     "clean:intents:dry": "DRY_RUN=true node scripts/clean-stale-intents.mjs",
-    "indexer:deadletter": "node scripts/indexer-deadletter.mjs"
+    "indexer:deadletter": "node scripts/indexer-deadletter.mjs",
+    "monitor:journey": "node scripts/journey-monitor.mjs",
+    "monitor:journey:dry": "node scripts/journey-monitor.mjs --dry-run",
+    "monitor:synthetic": "node scripts/synthetic-monitor.mjs",
+    "monitor:synthetic:dry": "node scripts/synthetic-monitor.mjs --dry-run",
+    "verify:restore": "node scripts/verify-restore.mjs",
+    "support:expire": "node scripts/expire-support-sessions.mjs",
+    "health:check": "node scripts/check-dependency-health.mjs"
   },
   "dependencies": {
     "@creit-tech/stellar-wallets-kit": "npm:@jsr/creit-tech__stellar-wallets-kit@^2.1.0",
@@ -59,13 +70,13 @@
     "recharts": "^3.10.0",
     "redis": "^4.7.0",
     "sanitize-html": "^2.17.7",
+    "sharp": "^0.34.5",
     "swagger-ui-react": "^5.32.6",
     "viem": "^2.48.2",
     "wagmi": "^2.19.5",
     "yauzl": "^3.4.0"
   },
   "devDependencies": {
-    "@nomicfoundation/hardhat-ethers": "^3.1.2",
     "@tailwindcss/postcss": "^4.2.3",
     "@testing-library/dom": "^10.4.1",
     "@testing-library/jest-dom": "^6.9.1",
@@ -82,9 +93,11 @@
     "jsdom": "^29.0.2",
     "mongodb-memory-server": "^11.2.0",
     "tailwindcss": "^4.2.3",
-    "typescript": "^6.0.3",
+    "typescript": "^5.9.3",
     "vitest": "^4.1.8",
-    "yazl": "^3.3.1"
+    "yaml": "^2.9.1",
+    "yazl": "^3.3.1",
+    "@types/react": "^19.3.0"
   },
   "overrides": {
     "undici": "^6.13.0",

@@ -32,7 +32,8 @@ import { NextResponse } from 'next/server';
 import { v4 as uuidv4 } from 'uuid';
 import { authorizeMaterialAccess } from '@/lib/entitlement';
 import { getDb } from '@/lib/mongodb';
-import { getIpfsUrl } from '@/lib/config/chain';
+import { getPinningProviders } from '@/lib/pinata';
+import { resolveFromGateways } from '@/lib/storage/pinningService';
 import { ObjectId } from 'mongodb';
 import { getUserFromCookie } from '@/lib/api/auth';
 import { normalizeBuyerAddress } from '@/lib/purchases/access';
@@ -42,6 +43,12 @@ import {
   CAPABILITY_MAX_BYTES,
 } from '@/lib/downloads/capabilityToken';
 import { recordDownloadAccess } from '@/lib/downloads/accessLog';
+import { buildAnalyticsEvent, enqueueAnalyticsEvent } from '@/lib/backend/analyticsEvents';
+import { withTelemetryRoute, ACTOR_TYPES } from '@/lib/monitoring/telemetry';
+import { renderProblemResponse } from '@/lib/errors/renderErrorResponse.js';
+import { AppError } from '@/lib/errors/AppError.js';
+import { withApiErrorHandling } from '@/lib/api/hardening';
+import { captureException } from '@/lib/sentry';
 
 export { CAPABILITY_TTL_MS, CAPABILITY_MAX_BYTES };
 
@@ -51,7 +58,7 @@ function clientIpFrom(request) {
   return request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || request.headers.get('x-real-ip') || null;
 }
 
-export async function GET(request) {
+async function handleGet(request) {
   const { searchParams } = new URL(request.url);
   const materialId = searchParams.get('materialId') ?? '';
   const buyerAddressParam = searchParams.get('buyerAddress') ?? '';
@@ -62,26 +69,23 @@ export async function GET(request) {
   // ── 1. Validate params
 
   if (!materialId) {
-    return NextResponse.json(
-      { error: 'Missing materialId' },
-      { status: 400 }
-    );
+    return renderProblemResponse("VALIDATION_FIELD", request, "Missing materialId");
   }
 
   // ── 2. Authenticate user from session cookie
 
   const user = await getUserFromCookie(request);
   if (!user) {
-    return NextResponse.json({ error: 'Authentication required' }, { status: 401 });
+    return renderProblemResponse("AUTH_UNAUTHENTICATED", request, "Authentication required");
   }
 
   const userAddress = normalizeBuyerAddress(user.walletAddress || user.address || user.id);
   if (!userAddress) {
-    return NextResponse.json({ error: 'No wallet address on account' }, { status: 400 });
+    return renderProblemResponse("VALIDATION_FIELD", request, "No wallet address on account");
   }
 
   if (buyerAddressParam && buyerAddressParam.toLowerCase() !== userAddress.toLowerCase()) {
-    return NextResponse.json({ error: 'Forbidden: Cannot request downloads for other accounts' }, { status: 403 });
+    return renderProblemResponse("AUTH_FORBIDDEN", request, "Forbidden: Cannot request downloads for other accounts");
   }
 
   const buyerAddress = buyerAddressParam || userAddress;
@@ -102,17 +106,22 @@ export async function GET(request) {
       material = await db.collection('materials').findOne({ _id: new ObjectId(materialId) });
     }
   } catch (err) {
-    console.error('[download] DB error fetching material:', err);
-    return NextResponse.json({ error: 'Material lookup failed' }, { status: 503 });
+    captureException(err, { route: "material-download", method: "GET" });
+    return renderProblemResponse("ENTITLEMENT_UNAVAILABLE", request, "Material lookup failed");
   }
 
   if (!material) {
-    return NextResponse.json({ error: 'Material not found' }, { status: 404 });
+    return renderProblemResponse("NOT_FOUND", request, "Material not found");
   }
 
   // ── 4. Verify access via the single entitlement policy boundary
 
-  const decision = await authorizeMaterialAccess({ db, material, buyerAddress });
+  let decision;
+  try {
+    decision = await authorizeMaterialAccess({ db, material, buyerAddress });
+  } catch (error) {
+    throw new AppError("ENTITLEMENT_UNAVAILABLE", { cause: error });
+  }
 
   if (!decision.allowed) {
     await recordDownloadAccess(db, {
@@ -123,15 +132,17 @@ export async function GET(request) {
       ipAddress,
     });
 
-    return NextResponse.json(
-      {
-        error: decision.state === 'unavailable' ? 'Entitlement verification unavailable' : 'Unlicensed Access',
-        detail:
-          decision.state === 'unavailable'
-            ? 'Could not confirm your entitlement right now. Please try again shortly.'
-            : 'You do not hold an active entitlement for this material. Please purchase it first.',
-      },
-      { status: decision.httpStatus }
+    const code = decision.state === 'unavailable'
+      ? "ENTITLEMENT_UNAVAILABLE"
+      : decision.httpStatus === 402
+        ? "ENTITLEMENT_PURCHASE_REQUIRED"
+        : "ENTITLEMENT_REQUIRED";
+    return renderProblemResponse(
+      code,
+      request,
+      decision.state === 'unavailable'
+        ? "Entitlement verification unavailable"
+        : "Unlicensed Access"
     );
   }
 
@@ -140,10 +151,7 @@ export async function GET(request) {
   const cid = material.ipfsCid ?? material.cid ?? material.fileHash ?? material.storageKey ?? material.fileUrl ?? '';
 
   if (!cid) {
-    return NextResponse.json(
-      { error: 'Material has no associated file CID' },
-      { status: 404 }
-    );
+    return renderProblemResponse("STORAGE_NOT_FOUND", request, "Material has no associated file CID");
   }
 
   // ── 5. Generate a signed capability token and return the capability URL
@@ -155,7 +163,7 @@ export async function GET(request) {
     byteRangeStart = parseInt(rangeParam.split('-')[0], 10);
     byteRangeEnd = parseInt(rangeParam.split('-')[1], 10);
     if (byteRangeEnd < byteRangeStart) {
-      return NextResponse.json({ error: 'Invalid byte range: end must be >= start' }, { status: 400 });
+      return renderProblemResponse("VALIDATION_FIELD", request, "Invalid byte range: end must be >= start");
     }
   }
 
@@ -165,9 +173,10 @@ export async function GET(request) {
   // Enforce per-capability quota: never exceed CAPABILITY_MAX_BYTES
   let effectiveByteRangeQuota = CAPABILITY_MAX_BYTES;
   if (rangeSize && rangeSize > CAPABILITY_MAX_BYTES) {
-    return NextResponse.json(
-      { error: `Requested byte range exceeds maximum capability quota of ${CAPABILITY_MAX_BYTES / 1_000_000}MB` },
-      { status: 413 }
+    return renderProblemResponse(
+      "VALIDATION_RANGE_TOO_LARGE",
+      request,
+      `Requested byte range exceeds maximum capability quota of ${CAPABILITY_MAX_BYTES / 1_000_000}MB`
     );
   }
   if (rangeSize) {
@@ -186,7 +195,14 @@ export async function GET(request) {
   });
 
   // Build the IPFS gateway URL with capability parameters
-  const baseGatewayUrl = getIpfsUrl(cid);
+  let baseGatewayUrl;
+  try {
+    baseGatewayUrl = /^https?:\/\//.test(cid)
+      ? cid
+      : (await resolveFromGateways(cid, getPinningProviders())).url;
+  } catch (error) {
+    throw new AppError("STORAGE_UNAVAILABLE", { cause: error });
+  }
   const capabilityQuery = new URLSearchParams({
     // Signed capability token
     cap: capabilityToken,
@@ -210,6 +226,20 @@ export async function GET(request) {
     byteRangeEnd,
     capabilityId: capabilityPayload.jti,
     ipAddress,
+  });
+  await enqueueAnalyticsEvent({
+    db,
+    event: buildAnalyticsEvent({
+      materialId,
+      eventType: 'download',
+      viewerId: buyerAddress,
+      ipAddress,
+      userAgent: request.headers.get('user-agent') || '',
+      headers: { accept: request.headers.get('accept') || '' },
+      dwellMs: 1000,
+      interactionCount: 1,
+      source: 'server-confirmed',
+    }),
   });
 
   return NextResponse.json(
@@ -241,3 +271,14 @@ export async function GET(request) {
     }
   );
 }
+
+export const GET = withTelemetryRoute(
+  'material.download',
+  ACTOR_TYPES.USER,
+  (request, context) =>
+    withApiErrorHandling(
+      request,
+      { route: "material-download" },
+      () => handleGet(request, context)
+    )
+);

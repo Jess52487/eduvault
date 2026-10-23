@@ -4,17 +4,21 @@ import { NextResponse } from "next/server";
 import { auditLog } from "@/lib/api/audit";
 import { withApiHardening } from "@/lib/api/hardening";
 import { parsePagination } from "@/lib/api/validation";
-import { buildMarketplaceDiscoveryQuery, buildMarketplaceSort } from "@/lib/backend/marketplaceDiscovery";
+import { applyMarketplaceRelevanceRanking, applyOwnershipRanking, buildMarketplaceDiscoveryQuery, buildMarketplaceFacetPipeline, buildMarketplaceSort, decodeMarketplaceCursor, encodeMarketplaceCursor, buildMarketplaceCursorClause } from "@/lib/backend/marketplaceDiscovery";
 import { MATERIAL_SEARCH_COLLECTION } from "@/lib/backend/materialSearchProjection";
+import { getOwnedMaterialIds } from "@/lib/entitlement";
 import { getDb } from "@/lib/mongodb";
 import { ObjectId } from "mongodb";
-import { cacheGet, cacheSet } from "@/lib/cache/redis";
+import { cacheGet, cacheSet, catalogCacheKey } from "@/lib/cache/redis";
+
+import { sanitizeMaterialPublic } from "@/lib/storage/protectedStorage";
 
 export const runtime = "nodejs";
 
 function sanitizeMaterial(doc) {
   if (!doc) return doc;
-  const { storageKey, fileUrl, metadataUrl, ...safe } = doc;
+  const publicSafe = sanitizeMaterialPublic(doc);
+  const { storageKey, fileUrl, metadataUrl, ...safe } = publicSafe;
   const averageScore = Number(safe.averageScore ?? safe.rating ?? 0) || 0;
   const feedbackCount = Number(safe.feedbackCount ?? safe.reviewsCount ?? 0) || 0;
 
@@ -73,20 +77,30 @@ export async function GET(request) {
     const pagination = parsePagination(url.searchParams);
     const { pageSize, paginationType } = pagination;
 
-    const cacheKey = `market-materials:${url.searchParams.toString()}`;
-    const cached = await cacheGet(cacheKey);
+    // Entitlement-aware ranking (#707): when the viewing wallet is supplied,
+    // results are personalized (owned materials marked/reranked), so the
+    // shared anonymous-browse cache is bypassed for this request.
+    const buyerAddress = (url.searchParams.get("buyerAddress") || "").trim() || null;
+
+    const cacheKey = await catalogCacheKey(url.searchParams.toString());
+    const cached = buyerAddress ? null : await cacheGet(cacheKey);
     if (cached) {
       return NextResponse.json(cached, { status: 200 });
     }
 
     const query = buildMarketplaceDiscoveryQuery(url.searchParams);
-    const sort = buildMarketplaceSort(url.searchParams.get("sortBy"));
+    const searchTerm = url.searchParams.get("search") || "";
+    const sortBy = url.searchParams.get("sortBy") || (searchTerm ? "relevance" : "newest");
+    const sort = buildMarketplaceSort(sortBy);
+    const facetsRequested = ["1", "true"].includes(url.searchParams.get("includeFacets"));
+    const facetQuery = facetsRequested ? buildMarketplaceDiscoveryQuery(url.searchParams) : null;
 
     let items;
     let hasNextPage = false;
     let nextCursor = null;
     let totalPages = null;
     let total = null;
+    let facets = null;
 
     if (paginationType === "cursor") {
       // Cursor-based pagination
@@ -95,60 +109,11 @@ export async function GET(request) {
       // Add cursor filter to query if provided
       if (cursor) {
         try {
-          // Decode the cursor - it contains the _id and sort field values
-          const cursorData = JSON.parse(Buffer.from(cursor, 'base64').toString('utf8'));
-          
-          // Build cursor query based on sort field
-          if (sort.createdAt) {
-            // For createdAt sort (newest first), we want documents older than cursor
-            if (sort.createdAt === -1) {
-              query.$and = query.$and || [];
-              query.$and.push({
-                $or: [
-                  { createdAt: { $lt: new Date(cursorData.createdAt) } },
-                  { 
-                    createdAt: new Date(cursorData.createdAt),
-                    _id: { $lt: new ObjectId(cursorData._id) }
-                  }
-                ]
-              });
-            }
-          } else if (sort.price) {
-            // For price sort, handle price + _id compound cursor
-            const priceOperator = sort.price === 1 ? '$gt' : '$lt';
-            const idOperator = sort.price === 1 ? '$gt' : '$lt';
-            
-            query.$and = query.$and || [];
-            query.$and.push({
-              $or: [
-                { price: { [priceOperator]: cursorData.price } },
-                { 
-                  price: cursorData.price,
-                  _id: { [idOperator]: new ObjectId(cursorData._id) }
-                }
-              ]
-            });
-          } else if (sort.rating || sort.likes) {
-            // For rating/popularity sort
-            const sortField = sort.rating ? 'rating' : 'likes';
-            const sortOrder = sort[sortField];
-            const operator = sortOrder === -1 ? '$lt' : '$gt';
-            const idOperator = sortOrder === -1 ? '$lt' : '$gt';
-            
-            query.$and = query.$and || [];
-            query.$and.push({
-              $or: [
-                { [sortField]: { [operator]: cursorData[sortField] } },
-                { 
-                  [sortField]: cursorData[sortField],
-                  _id: { [idOperator]: new ObjectId(cursorData._id) }
-                }
-              ]
-            });
-          }
-        } catch (e) {
-          // Invalid cursor - ignore and start from beginning
-          console.warn('Invalid cursor provided:', cursor);
+          const cursorData = decodeMarketplaceCursor(cursor, sort);
+          query.$and = query.$and || [];
+          query.$and.push(buildMarketplaceCursorClause(cursorData, sort));
+        } catch {
+          return NextResponse.json({ error: "Invalid cursor" }, { status: 400 });
         }
       }
 
@@ -169,20 +134,7 @@ export async function GET(request) {
       // Generate next cursor if there are more items
       if (hasNextPage && items.length > 0) {
         const lastItem = items[items.length - 1];
-        const cursorData = { _id: lastItem._id.toString() };
-        
-        // Add sort field to cursor
-        if (sort.createdAt) {
-          cursorData.createdAt = lastItem.createdAt.toISOString();
-        } else if (sort.price) {
-          cursorData.price = lastItem.price;
-        } else if (sort.rating) {
-          cursorData.rating = lastItem.rating || lastItem.averageScore || 0;
-        } else if (sort.likes) {
-          cursorData.likes = lastItem.likes || 0;
-        }
-        
-        nextCursor = Buffer.from(JSON.stringify(cursorData)).toString('base64');
+        nextCursor = encodeMarketplaceCursor(lastItem, sort);
       }
     } else {
       // Legacy offset-based pagination
@@ -200,26 +152,56 @@ export async function GET(request) {
       totalPages = Math.max(1, Math.ceil(total / pageSize));
     }
 
-    const normalized = items.map(sanitizeMaterial);
+    let normalized = items.map(sanitizeMaterial);
 
-    const payload = paginationType === "cursor" 
-      ? { 
-          items: normalized, 
-          pageSize, 
-          hasNextPage, 
+    if (searchTerm || sortBy === "relevance") {
+      normalized = applyMarketplaceRelevanceRanking(normalized, searchTerm);
+    }
+
+    if (facetsRequested) {
+      const facetRows = await db
+        .collection(MATERIAL_SEARCH_COLLECTION)
+        .aggregate(buildMarketplaceFacetPipeline(facetQuery))
+        .toArray();
+      facets = Object.fromEntries(Object.entries(facetRows[0] || {}).map(([field, values]) => [
+        field,
+        values.map(({ _id: value, count }) => ({ value, count })),
+      ]));
+    }
+
+    // Entitlement-aware ranking (#707): mark and rerank this page's results
+    // by whether the viewing wallet already owns each material. Best-effort
+    // — a lookup failure just leaves the page unranked, never blocks it.
+    if (buyerAddress) {
+      const materialIds = normalized
+        .map((item) => String(item.materialId ?? item._id ?? ""))
+        .filter(Boolean);
+      const ownedIds = await getOwnedMaterialIds({ db, buyerAddress, materialIds });
+      normalized = applyOwnershipRanking(normalized, ownedIds);
+    }
+
+    const payload = paginationType === "cursor"
+      ? {
+          items: normalized,
+          pageSize,
+          hasNextPage,
           nextCursor,
+          ...(facets ? { facets } : {}),
           paginationType: "cursor"
         }
-      : { 
-          items: normalized, 
-          page: pagination.page, 
-          pageSize, 
-          total, 
+      : {
+          items: normalized,
+          page: pagination.page,
+          pageSize,
+          total,
           totalPages,
+          ...(facets ? { facets } : {}),
           paginationType: "offset"
         };
 
-    await cacheSet(cacheKey, payload, 600);
+    if (!buyerAddress) {
+      await cacheSet(cacheKey, payload, 600);
+    }
 
     return NextResponse.json(payload, { status: 200 });
   } catch (err) {

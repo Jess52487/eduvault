@@ -3,25 +3,20 @@ export const runtime = "nodejs";
 
 import { NextResponse } from "next/server";
 import { getDb } from "@/lib/mongodb";
-import { getUserFromCookie } from "@/lib/api/auth";
+import { requirePermission } from "@/lib/api/auth";
 import { auditLog } from "@/lib/api/audit";
 import { appendAuditRecord } from "@/lib/backend/auditLedger";
 
-async function getAdminUser(request) {
-  const user = await getUserFromCookie(request);
-  if (!user || user.role !== "admin") return null;
-  return user;
-}
-
 export async function POST(request) {
   try {
-    const admin = await getAdminUser(request);
-    if (!admin) {
+    const authorization = await requirePermission(request, "admin:verification:manage");
+    if (!authorization.ok) {
       return NextResponse.json(
-        { error: "Unauthorized. Admin access required." },
-        { status: 403 }
+        { error: "Forbidden" },
+        { status: authorization.status }
       );
     }
+    const admin = authorization.user;
 
     const body = await request.json();
     const { applicationId, action } = body;
@@ -66,12 +61,20 @@ export async function POST(request) {
     );
 
     if (action === "approve") {
+      const expiresAt = new Date();
+      expiresAt.setFullYear(expiresAt.getFullYear() + 1); // 1 year expiry
+
       await profiles.updateOne(
         { uuid: application.userUuid },
         {
           $set: {
             profileType: application.requestedType || "institution",
-            verifiedAt: new Date(),
+            credential: {
+              issuer: admin.sub || admin._id,
+              evidence: `urn:eduvault:verification:${applicationId}`,
+              expiresAt: expiresAt,
+              status: "active"
+            },
             updatedAt: new Date(),
           },
         }
@@ -109,11 +112,11 @@ export async function POST(request) {
 
 export async function GET(request) {
   try {
-    const admin = await getAdminUser(request);
-    if (!admin) {
+    const authorization = await requirePermission(request, "admin:verification:read");
+    if (!authorization.ok) {
       return NextResponse.json(
-        { error: "Unauthorized. Admin access required." },
-        { status: 403 }
+        { error: "Forbidden" },
+        { status: authorization.status }
       );
     }
 

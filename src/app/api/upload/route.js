@@ -1,16 +1,22 @@
 // Resolves #430: Implement a secure API route that receives file uploads and pins them to IPFS via Pinata.
 import { NextResponse } from 'next/server'
 import { auditLog } from '@/lib/api/audit'
+import { requirePermission } from '@/lib/api/auth'
 import { withApiHardening } from '@/lib/api/hardening'
 import { normalizeStringList, sanitizeObject, validateUploadPayload, validateUploadFileMetadata } from '@/lib/api/validation'
-import { pinata } from '@/lib/pinata'
+import { getPinningProviders } from '@/lib/pinata'
+import { pinWithQuorum, resolveFromGateways } from '@/lib/storage/pinningService'
+import { assertStorageCapacity } from '@/lib/storage/quotaMonitor'
 import { validatePinataResponse, validateGatewayUrl, retryWithBackoff } from '@/lib/api/storage'
 import { sanitizeRichText, isSafeUrl } from '@/lib/api/contentSanitizer'
 import { guardZipArchiveUpload } from '@/lib/backend/archiveUploadGuard'
 import { validateUploadedFile, detectExecutableExtension } from '@/lib/ipfs/uploadValidator'
 import { createQuarantineRecord } from '@/lib/publishing/quarantine'
+import { assertActorQuota, consumeActorQuota, UserQuotaError } from '@/lib/quotaManager'
 import { enqueueSideEffect } from '@/lib/backend/outbox'
 import { getDb } from '@/lib/mongodb'
+import { processThumbnail, ThumbnailProcessingError } from '@/lib/upload/processThumbnail'
+import { withTelemetryRoute, ACTOR_TYPES } from '@/lib/monitoring/telemetry'
 
 export const dynamic = 'force-dynamic'
 
@@ -52,15 +58,22 @@ const ALLOWED_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp']
 const RETRY_ATTEMPTS = 3
 const RETRY_DELAY_MS = 1000
 
-export async function POST(request) {
+async function handlePost(request) {
   return withApiHardening(
     request,
     { route: 'upload', rateLimit: { limit: 20, windowMs: 60_000 } },
     async () => {
       try {
+        const authorization = await requirePermission(request, 'creator:manage')
+        if (!authorization.ok) {
+          auditLog({ event: 'auth_failed', route: 'upload', method: 'POST', status: authorization.status })
+          return NextResponse.json({ error: 'Creator access required' }, { status: authorization.status })
+        }
+        const user = authorization.user
+
         const form = await request.formData()
         const file = form.get('file')
-        const image = form.get('thumbnail')
+        let image = form.get('thumbnail')
 
         // 1️⃣ Validate Required Fields
         if (!file) {
@@ -131,6 +144,18 @@ export async function POST(request) {
           }
         }
 
+        // Decode and re-encode thumbnails before quota accounting or pinning.
+        // The stored object is always a bounded WebP with metadata removed.
+        if (image) {
+          try {
+            image = await processThumbnail(image)
+          } catch (processingError) {
+            const status = processingError instanceof ThumbnailProcessingError ? 422 : 500
+            auditLog({ event: 'upload_failed', route: 'upload', method: 'POST', status, reason: `thumbnail_processing_failure: ${processingError.message}` })
+            return NextResponse.json({ error: processingError.message }, { status })
+          }
+        }
+
         // 3.5️⃣ Validate file metadata with structured validation
         try {
           validateUploadFileMetadata(file, 'file')
@@ -173,11 +198,37 @@ export async function POST(request) {
         }
 
         const results = {}
+        const db = await getDb()
+        // Derive quota scope from the authenticated account; never trust a
+        // caller-supplied wallet header to choose a fresh quota bucket.
+        const uploaderAddress = user.walletAddress || user.address || user.sub
+        const totalSize = file.size + (image?.size || 0)
+        
+        try {
+          await assertStorageCapacity(db, totalSize)
+        } catch (quotaError) {
+          auditLog({ event: 'upload_paused', route: 'upload', method: 'POST', status: 503, reason: 'storage_quota_exhausted' })
+          return NextResponse.json({ error: quotaError.message, retryable: true }, { status: 503 })
+        }
+        
+        try {
+          await assertActorQuota(db, uploaderAddress, 'storage', totalSize)
+          await assertActorQuota(db, uploaderAddress, 'compute', 1)
+          await assertActorQuota(db, uploaderAddress, 'indexing', 1)
+          await consumeActorQuota(db, uploaderAddress, 'storage', totalSize)
+          await consumeActorQuota(db, uploaderAddress, 'compute', 1)
+          await consumeActorQuota(db, uploaderAddress, 'indexing', 1)
+        } catch (quotaError) {
+          if (!(quotaError instanceof UserQuotaError)) throw quotaError
+          auditLog({ event: 'upload_failed', route: 'upload', method: 'POST', status: 429, reason: `user_${quotaError.resource}_quota_exceeded` })
+          return NextResponse.json({ error: quotaError.message, resource: quotaError.resource }, { status: 429 })
+        }
+        const pinningProviders = getPinningProviders()
 
         // 4️⃣ Upload the main file (with bounded retry/backoff)
         try {
           const uploadedFile = await retryWithBackoff(
-            () => pinata.upload.public.file(file),
+            () => pinWithQuorum(pinningProviders, 'pinFile', file),
             RETRY_ATTEMPTS,
             RETRY_DELAY_MS,
             (err, attempt) => console.warn(`[Storage] Document upload attempt ${attempt} failed: ${err.message}`)
@@ -185,7 +236,7 @@ export async function POST(request) {
           validatePinataResponse(uploadedFile, 'document')
 
           const fileUrl = await retryWithBackoff(
-            () => pinata.gateways.public.convert(uploadedFile.cid),
+            () => resolveFromGateways(uploadedFile.cid, pinningProviders).then((result) => result.url),
             RETRY_ATTEMPTS,
             RETRY_DELAY_MS,
             (err, attempt) => console.warn(`[Storage] Document gateway conversion attempt ${attempt} failed: ${err.message}`)
@@ -201,8 +252,6 @@ export async function POST(request) {
           // unavailable the record stays pending (fail-closed) and the material
           // remains hidden rather than being published unsafely.
           try {
-            const db = await getDb()
-            const uploaderAddress = request.headers.get('x-wallet-address') || 'anonymous'
             const quarantine = await createQuarantineRecord({
               db,
               contentHash: uploadedFile.cid,
@@ -246,7 +295,7 @@ export async function POST(request) {
         if (image) {
           try {
             const fileThumb = await retryWithBackoff(
-              () => pinata.upload.public.file(image),
+              () => pinWithQuorum(pinningProviders, 'pinFile', image),
               RETRY_ATTEMPTS,
               RETRY_DELAY_MS,
               (err, attempt) => console.warn(`[Storage] Thumbnail upload attempt ${attempt} failed: ${err.message}`)
@@ -254,7 +303,7 @@ export async function POST(request) {
             validatePinataResponse(fileThumb, 'thumbnail')
 
             const imgUrl = await retryWithBackoff(
-              () => pinata.gateways.public.convert(fileThumb.cid),
+              () => resolveFromGateways(fileThumb.cid, pinningProviders).then((result) => result.url),
               RETRY_ATTEMPTS,
               RETRY_DELAY_MS,
               (err, attempt) => console.warn(`[Storage] Thumbnail gateway conversion attempt ${attempt} failed: ${err.message}`)
@@ -340,7 +389,7 @@ export async function POST(request) {
         // 7️⃣ Upload metadata JSON to Pinata (with bounded retry/backoff)
         try {
           const uploadedJson = await retryWithBackoff(
-            () => pinata.upload.public.json(metadataJSON),
+            () => pinWithQuorum(pinningProviders, 'pinJson', metadataJSON),
             RETRY_ATTEMPTS,
             RETRY_DELAY_MS,
             (err, attempt) => console.warn(`[Storage] Metadata upload attempt ${attempt} failed: ${err.message}`)
@@ -348,7 +397,7 @@ export async function POST(request) {
           validatePinataResponse(uploadedJson, 'metadata')
 
           const jsonUrl = await retryWithBackoff(
-            () => pinata.gateways.public.convert(uploadedJson.cid),
+            () => resolveFromGateways(uploadedJson.cid, pinningProviders).then((result) => result.url),
             RETRY_ATTEMPTS,
             RETRY_DELAY_MS,
             (err, attempt) => console.warn(`[Storage] Metadata gateway conversion attempt ${attempt} failed: ${err.message}`)
@@ -364,7 +413,7 @@ export async function POST(request) {
         // 8️⃣ Return the CID as storageKey plus URLs for backwards-compatibility
         return NextResponse.json({
           success: true,
-          storageKey: results.storageKey || (uploadedFile && uploadedFile.cid),
+          storageKey: results.storageKey,
           fileUrl: results.fileUrl,
           image: results.imgUrl || '',
           metadata: results.metadataUrl,
@@ -377,3 +426,5 @@ export async function POST(request) {
     }
   )
 }
+
+export const POST = withTelemetryRoute('material.upload', ACTOR_TYPES.CREATOR, handlePost)

@@ -201,7 +201,12 @@ fn install_and_init_contract<'a>(
     (contract_id, client)
 }
 
-fn setup_purchase(
+/// Registers a contract, registry, and an Active material with a single
+/// accepted asset (1_000_000 units), but does not purchase it — used by
+/// tests that need to drive `record_quote` / `purchase` / `simulate_purchase`
+/// themselves (#701, #706) instead of starting from an already-completed
+/// purchase.
+fn setup_unpurchased(
     env: &Env,
 ) -> (
     Address,
@@ -210,7 +215,8 @@ fn setup_purchase(
     Address,
     Address,
     BytesN<32>,
-    u64,
+    MockRegistryClient<'_>,
+    Address,
 ) {
     env.mock_all_auths();
 
@@ -257,6 +263,32 @@ fn setup_purchase(
 
     let (contract_id, client) = install_and_init_contract(env, &admin, &registry, &treasury, 500);
     client.set_asset_allowed(&admin, &asset, &AssetKind::Token, &true);
+
+    (
+        contract_id,
+        client,
+        buyer,
+        creator,
+        asset,
+        material_id,
+        registry_client,
+        admin,
+    )
+}
+
+fn setup_purchase(
+    env: &Env,
+) -> (
+    Address,
+    PurchaseManagerClient<'_>,
+    Address,
+    Address,
+    Address,
+    BytesN<32>,
+    u64,
+) {
+    let (contract_id, client, buyer, creator, asset, material_id, _registry_client, _admin) =
+        setup_unpurchased(env);
 
     let purchase_id = client.purchase(
         &buyer,
@@ -1291,7 +1323,7 @@ fn rejects_unauthorized_platform_config_change() {
     let (_, client) = install_and_init_contract(&env, &admin, &registry, &treasury, 500);
 
     let new_treasury = Address::generate(&env);
-    let result = client.try_set_platform_config(&unauthorized_user, &new_treasury, &600, &false);
+    let result = client.try_propose_platform_config(&unauthorized_user, &new_treasury, &600, &false);
     assert_eq!(result, Err(Ok(PurchaseError::NotAuthorized)));
 }
 
@@ -4032,5 +4064,859 @@ fn test_partial_bulk_refund_preserves_remaining_entitlement_payment_state() {
             SettlementState::Pending
         );
         kept_idx += 1;
+    }
+}
+
+#[test]
+fn test_platform_config_multistep_approval() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let admin2 = Address::generate(&env);
+    let registry = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let new_treasury = Address::generate(&env);
+
+    let (_, client) = install_and_init_contract(&env, &admin, &registry, &treasury, 500);
+
+    // admin proposes new config
+    client.propose_platform_config(&admin, &new_treasury, &600, &false);
+
+    // admin cannot approve their own proposal
+    let result = client.try_approve_platform_config(&admin);
+    assert_eq!(result, Err(Ok(PurchaseError::CannotApproveOwnProposal)));
+
+    // transfer admin to admin2
+    client.transfer_admin(&admin, &admin2, &86400);
+    env.ledger().set_timestamp(env.ledger().timestamp().saturating_add(86401));
+    client.accept_admin(&admin2);
+
+    // admin2 approves the proposal
+    client.approve_platform_config(&admin2);
+
+    // Verify the config is updated
+    let config = client.get_platform_config().unwrap();
+    assert_eq!(config.treasury, new_treasury);
+    assert_eq!(config.platform_fee_bps, 600);
+}
+
+// ── Checkout quote expiry & binding (#701) ─────────────────────────────────
+
+#[test]
+fn record_quote_binds_price_asset_version_and_expiry() {
+    let env = Env::default();
+    let (_contract_id, client, buyer, _creator, asset, material_id, _registry, _admin) =
+        setup_unpurchased(&env);
+
+    let quote = client.record_quote(&buyer, &material_id, &asset);
+
+    assert_eq!(quote.material_id, material_id);
+    assert_eq!(quote.buyer, buyer);
+    assert_eq!(quote.asset, asset);
+    assert_eq!(quote.amount, 1_000_000);
+    assert_eq!(quote.sale_terms_version, 1);
+    assert_eq!(quote.issued_at, env.ledger().timestamp());
+    assert_eq!(quote.expires_at, quote.issued_at + QUOTE_TTL_SECONDS);
+}
+
+#[test]
+fn purchase_succeeds_with_valid_unexpired_quote() {
+    let env = Env::default();
+    let (_contract_id, client, buyer, _creator, asset, material_id, _registry, _admin) =
+        setup_unpurchased(&env);
+
+    client.record_quote(&buyer, &material_id, &asset);
+
+    // Still well within QUOTE_TTL_SECONDS.
+    let mut ledger = env.ledger().get();
+    ledger.timestamp += QUOTE_TTL_SECONDS / 2;
+    env.ledger().set(ledger);
+
+    client.purchase(
+        &buyer,
+        &material_id,
+        &asset,
+        &1_000_000,
+        &sample_transaction_id(&env),
+    );
+    assert!(client.has_entitlement(&material_id, &buyer));
+}
+
+#[test]
+fn purchase_fails_when_sale_terms_version_changes_after_quote() {
+    let env = Env::default();
+    let (_contract_id, client, buyer, _creator, asset, material_id, registry, _admin) =
+        setup_unpurchased(&env);
+
+    client.record_quote(&buyer, &material_id, &asset);
+
+    // Creator updates sale terms (price/asset unchanged here, but the
+    // version bumps — e.g. a metadata or rights update): the registry's
+    // sale-terms version moves on from what the quote captured.
+    registry.set_material_immutable(
+        &material_id,
+        &MockImmutableSnapshot {
+            metadata_uri: soroban_sdk::String::from_str(&env, "ipfs://metadata-v2"),
+            metadata_hash: bytes32(&env, 11),
+            rights_hash: bytes32(&env, 22),
+        },
+        &2,
+    );
+
+    let result = client.try_purchase(
+        &buyer,
+        &material_id,
+        &asset,
+        &1_000_000,
+        &sample_transaction_id(&env),
+    );
+    assert_eq!(result, Err(Ok(PurchaseError::StaleSaleTermsQuote)));
+}
+
+#[test]
+fn purchase_fails_when_quote_asset_differs_from_recorded() {
+    let env = Env::default();
+    let (_contract_id, client, buyer, creator, asset_a, material_id, registry, admin) =
+        setup_unpurchased(&env);
+
+    // A second accepted asset for the same material, allowlisted at the
+    // contract level just like the first.
+    let asset_b = env.register(MockAsset, ());
+    client.set_asset_allowed(&admin, &asset_b, &AssetKind::Token, &true);
+
+    let material = MaterialRecord {
+        material_id: material_id.clone(),
+        creator: creator.clone(),
+        paused: false,
+        status: MaterialStatus::Active,
+        quotes: vec![
+            &env,
+            AssetQuote {
+                asset: asset_a.clone(),
+                amount: 1_000_000,
+            },
+            AssetQuote {
+                asset: asset_b.clone(),
+                amount: 2_000_000,
+            },
+        ],
+        payout_shares: vec![
+            &env,
+            PayoutShare {
+                recipient: creator.clone(),
+                share_bps: 10_000,
+            },
+        ],
+    };
+    registry.set_material(&material_id, &material);
+
+    client.record_quote(&buyer, &material_id, &asset_a);
+
+    // Buyer switches to the other accepted asset without re-quoting.
+    let result = client.try_purchase(
+        &buyer,
+        &material_id,
+        &asset_b,
+        &2_000_000,
+        &sample_transaction_id(&env),
+    );
+    assert_eq!(result, Err(Ok(PurchaseError::StaleQuoteAsset)));
+}
+
+#[test]
+fn purchase_fails_when_quote_expired() {
+    let env = Env::default();
+    let (_contract_id, client, buyer, _creator, asset, material_id, _registry, _admin) =
+        setup_unpurchased(&env);
+
+    client.record_quote(&buyer, &material_id, &asset);
+
+    let mut ledger = env.ledger().get();
+    ledger.timestamp += QUOTE_TTL_SECONDS + 1;
+    env.ledger().set(ledger);
+
+    let result = client.try_purchase(
+        &buyer,
+        &material_id,
+        &asset,
+        &1_000_000,
+        &sample_transaction_id(&env),
+    );
+    assert_eq!(result, Err(Ok(PurchaseError::QuoteExpired)));
+}
+
+/// A quote is scoped to the wallet that recorded it (#701 acceptance
+/// criteria: "wrong buyer"). A different buyer who never called
+/// `record_quote` is unaffected by another wallet's (even expired) quote.
+#[test]
+fn quote_is_scoped_to_the_recording_buyer() {
+    let env = Env::default();
+    let (_contract_id, client, buyer_a, _creator, asset, material_id, _registry, _admin) =
+        setup_unpurchased(&env);
+    let buyer_b = Address::generate(&env);
+
+    client.record_quote(&buyer_a, &material_id, &asset);
+
+    // Expire buyer_a's quote.
+    let mut ledger = env.ledger().get();
+    ledger.timestamp += QUOTE_TTL_SECONDS + 1;
+    env.ledger().set(ledger);
+
+    // buyer_b never recorded a quote, so buyer_a's expiry doesn't touch them.
+    client.purchase(
+        &buyer_b,
+        &material_id,
+        &asset,
+        &1_000_000,
+        &sample_transaction_id(&env),
+    );
+    assert!(client.has_entitlement(&material_id, &buyer_b));
+
+    // buyer_a is still blocked by their own expired quote.
+    let result = client.try_purchase(
+        &buyer_a,
+        &material_id,
+        &asset,
+        &1_000_000,
+        &sample_transaction_id(&env),
+    );
+    assert_eq!(result, Err(Ok(PurchaseError::QuoteExpired)));
+}
+
+#[test]
+fn purchase_succeeds_without_ever_recording_a_quote() {
+    let env = Env::default();
+    let (_contract_id, client, buyer, _creator, asset, material_id, _registry, _admin) =
+        setup_unpurchased(&env);
+
+    // record_quote is optional: purchasing without ever calling it must
+    // still work exactly as before #701.
+    client.purchase(
+        &buyer,
+        &material_id,
+        &asset,
+        &1_000_000,
+        &sample_transaction_id(&env),
+    );
+    assert!(client.has_entitlement(&material_id, &buyer));
+}
+
+// ── Read-only checkout preflight (#706) ────────────────────────────────────
+
+#[test]
+fn simulate_purchase_returns_ok_for_valid_checkout() {
+    let env = Env::default();
+    let (_contract_id, client, buyer, _creator, asset, material_id, _registry, _admin) =
+        setup_unpurchased(&env);
+
+    let result = client.simulate_purchase(&buyer, &material_id, &asset, &1_000_000);
+    assert_eq!(result, 1);
+
+    // A pure read: no entitlement was created by the simulation.
+    assert!(!client.has_entitlement(&material_id, &buyer));
+}
+
+#[test]
+fn simulate_purchase_reports_entitlement_already_exists() {
+    let env = Env::default();
+    let (_contract_id, client, buyer, _creator, asset, material_id, _registry, _admin) =
+        setup_unpurchased(&env);
+
+    client.purchase(
+        &buyer,
+        &material_id,
+        &asset,
+        &1_000_000,
+        &sample_transaction_id(&env),
+    );
+
+    let result = client.try_simulate_purchase(&buyer, &material_id, &asset, &1_000_000);
+    assert_eq!(result, Err(Ok(PurchaseError::EntitlementAlreadyExists)));
+}
+
+#[test]
+fn simulate_purchase_reports_price_mismatch() {
+    let env = Env::default();
+    let (_contract_id, client, buyer, _creator, asset, material_id, _registry, _admin) =
+        setup_unpurchased(&env);
+
+    let result = client.try_simulate_purchase(&buyer, &material_id, &asset, &999);
+    assert_eq!(result, Err(Ok(PurchaseError::InvalidQuoteAmount)));
+}
+
+#[test]
+fn simulate_purchase_reports_material_not_active() {
+    let env = Env::default();
+    let (_contract_id, client, buyer, creator, asset, material_id, registry, _admin) =
+        setup_unpurchased(&env);
+
+    let material = MaterialRecord {
+        material_id: material_id.clone(),
+        creator: creator.clone(),
+        paused: false,
+        status: MaterialStatus::Paused,
+        quotes: vec![
+            &env,
+            AssetQuote {
+                asset: asset.clone(),
+                amount: 1_000_000,
+            },
+        ],
+        payout_shares: vec![
+            &env,
+            PayoutShare {
+                recipient: creator.clone(),
+                share_bps: 10_000,
+            },
+        ],
+    };
+    registry.set_material(&material_id, &material);
+
+    let result = client.try_simulate_purchase(&buyer, &material_id, &asset, &1_000_000);
+    assert_eq!(result, Err(Ok(PurchaseError::MaterialNotActive)));
+}
+
+#[test]
+fn simulate_purchase_reports_asset_not_accepted() {
+    let env = Env::default();
+    let (_contract_id, client, buyer, _creator, _asset, material_id, _registry, admin) =
+        setup_unpurchased(&env);
+    // Allowlisted at the contract level, but not part of this material's
+    // own quotes — isolates AssetNotAcceptedForMaterial from AssetNotAllowed.
+    let other_asset = env.register(MockAsset, ());
+    client.set_asset_allowed(&admin, &other_asset, &AssetKind::Token, &true);
+
+    let result = client.try_simulate_purchase(&buyer, &material_id, &other_asset, &1_000_000);
+    assert_eq!(result, Err(Ok(PurchaseError::AssetNotAcceptedForMaterial)));
+}
+
+/// simulate_purchase() must be a pure read: no wallet auth and no state
+/// mutation, so the frontend can call it before a wallet is even connected.
+#[test]
+fn simulate_purchase_does_not_mutate_state_or_require_auth() {
+    let env = Env::default();
+    let (_contract_id, client, buyer, _creator, asset, material_id, _registry, _admin) =
+        setup_unpurchased(&env);
+
+    // Drop every recorded auth from setup: the simulate call below must
+    // succeed without any of them.
+    env.set_auths(&[]);
+
+    let result = client.simulate_purchase(&buyer, &material_id, &asset, &1_000_000);
+    assert_eq!(result, 1);
+
+    // Still no entitlement, no pending checkout — nothing was written.
+    assert!(!client.has_entitlement(&material_id, &buyer));
+}
+
+
+// ============================================================
+// Property / Invariant Tests (Issue: fuzz/property test suite)
+// ============================================================
+//
+// These tests verify purchase-manager invariants across randomised prices,
+// buyer scenarios, creator tiers, entitlement states, and refund attempts.
+// "Randomness" is deterministic: a u8 seed drives every parameter so any
+// failure can always be reproduced by re-running at the same seed value.
+//
+// Invariant catalogue:
+//   P1  – balance cannot go negative: refund amount ≤ escrowed seller_net.
+//   P2  – entitlement is unique: purchasing the same material twice for the
+//         same buyer is rejected with EntitlementAlreadyExists.
+//   P3  – refund is idempotent at the error level: a second refund attempt
+//         on an already-refunded purchase always returns RefundNotAllowed.
+//   P4  – over-refund is impossible: a refund never transfers more than the
+//         escrowed seller_net.
+//   P5  – platform fee is non-negative and ≤ gross price for all valid
+//         platform_fee_bps values across the three creator tiers.
+//   P6  – seller_net + platform_fee = gross price (no money created or lost).
+//   P7  – purchase_id increments sequentially: no gaps and no reuse.
+//   P8  – entitlement revocation after refund blocks reconcile_entitlement.
+//   P9  – bulk-license recipient count is bounded: TooManyRecipients fires
+//         exactly at MAX_BULK_LICENSE_RECIPIENTS + 1.
+//  P10  – quote expiry is enforced: an expired quote blocks purchase but a
+//         fresh quote on the same material succeeds.
+//  P11  – dispute window prevents disputes after the threshold; within the
+//         window, every valid buyer may open exactly one dispute.
+//  P12  – partial bulk refund never touches settlements outside the batch
+//         limit, preserving all remaining entitlements.
+
+fn prop_sweep(mut f: impl FnMut(u8)) {
+    for seed in 0u8..=255 {
+        f(seed);
+    }
+}
+
+// ── shared setup helpers for property tests ───────────────────────────────
+
+/// Set up a fresh PurchaseManager with a mock registry and a single active
+/// material.  `price` is the material's quote amount for the returned asset.
+/// Returns `(contract_id, client, admin, buyer, creator, asset, material_id)`.
+fn prop_setup_with_price(
+    env: &Env,
+    price: i128,
+    platform_fee_bps: u32,
+) -> (
+    Address,
+    PurchaseManagerClient<'_>,
+    Address,
+    Address,
+    Address,
+    Address,
+    BytesN<32>,
+) {
+    env.mock_all_auths();
+
+    let admin    = Address::generate(env);
+    let registry = env.register(MockRegistry, ());
+    let treasury = Address::generate(env);
+    let buyer    = Address::generate(env);
+    let creator  = Address::generate(env);
+    let asset    = env.register(MockAsset, ());
+
+    let material_id = bytes32(env, 1);
+    let material = MaterialRecord {
+        material_id: material_id.clone(),
+        creator: creator.clone(),
+        paused:  false,
+        status:  MaterialStatus::Active,
+        quotes: soroban_sdk::vec![env, AssetQuote { asset: asset.clone(), amount: price }],
+        payout_shares: soroban_sdk::vec![env, PayoutShare { recipient: creator.clone(), share_bps: 10_000 }],
+    };
+    MockRegistryClient::new(env, &registry).set_material(&material_id, &material);
+    MockRegistryClient::new(env, &registry).set_material_immutable(
+        &material_id,
+        &MockImmutableSnapshot {
+            metadata_uri: soroban_sdk::String::from_str(env, "ipfs://prop-test"),
+            metadata_hash: bytes32(env, 11),
+            rights_hash:   bytes32(env, 22),
+        },
+        &1,
+    );
+
+    let (contract_id, client) = install_and_init_contract(env, &admin, &registry, &treasury, platform_fee_bps);
+    client.set_asset_allowed(&admin, &asset, &AssetKind::Token, &true);
+
+    (contract_id, client, admin, buyer, creator, asset, material_id)
+}
+
+// ── P1 + P4: refund ≤ escrow seller_net (no negative balance, no over-refund)
+#[test]
+fn property_p1_p4_refund_never_exceeds_escrowed_seller_net() {
+    prop_sweep(|seed| {
+        let env = Env::default();
+        // Price varies from 10_000 to 2_660_000 across seeds.
+        let price: i128 = 10_000 + seed as i128 * 10_000;
+        let fee_bps: u32 = seed as u32 % 1_001; // 0..=1000 bps (max allowed is 1000)
+        let (_, client, admin, buyer, _creator, asset, material_id) =
+            prop_setup_with_price(&env, price, fee_bps);
+
+        let purchase_id = client.purchase(
+            &buyer, &material_id, &asset, &price, &sample_transaction_id(&env),
+        );
+
+        let escrow = client.get_escrow_record(&purchase_id).unwrap();
+        let seller_net = escrow.seller_net;
+
+        // Invariant: seller_net ≥ 0 always.
+        assert!(
+            seller_net >= 0,
+            "seed={seed}: seller_net {seller_net} is negative"
+        );
+
+        client.refund_purchase(&admin, &purchase_id);
+
+        let settlement = client.get_settlement(&purchase_id).unwrap();
+        // Invariant: refunded_amount ≤ seller_net (over-refund impossible).
+        assert!(
+            settlement.refunded_amount <= seller_net,
+            "seed={seed}: refunded_amount {} > seller_net {}",
+            settlement.refunded_amount, seller_net
+        );
+
+        // Invariant: refunded_amount ≥ 0 (no negative refund).
+        assert!(
+            settlement.refunded_amount >= 0,
+            "seed={seed}: negative refunded_amount {}",
+            settlement.refunded_amount
+        );
+    });
+}
+
+// ── P2: duplicate entitlement is rejected ─────────────────────────────────
+#[test]
+fn property_p2_duplicate_entitlement_always_rejected() {
+    prop_sweep(|seed| {
+        let env = Env::default();
+        let price: i128 = 100_000 + seed as i128 * 5_000;
+        let (_, client, _admin, buyer, _creator, asset, material_id) =
+            prop_setup_with_price(&env, price, 500);
+
+        // First purchase succeeds.
+        client.purchase(&buyer, &material_id, &asset, &price, &sample_transaction_id(&env));
+        assert!(client.has_entitlement(&material_id, &buyer));
+
+        // Second purchase for the same buyer + material must be rejected.
+        let dup = client.try_purchase(
+            &buyer, &material_id, &asset, &price, &sample_transaction_id(&env),
+        );
+        assert_eq!(
+            dup,
+            Err(Ok(PurchaseError::EntitlementAlreadyExists)),
+            "seed={seed}: expected EntitlementAlreadyExists"
+        );
+    });
+}
+
+// ── P3: second refund always returns RefundNotAllowed ─────────────────────
+#[test]
+fn property_p3_second_refund_always_returns_refund_not_allowed() {
+    prop_sweep(|seed| {
+        let env = Env::default();
+        let price: i128 = 50_000 + seed as i128 * 3_000;
+        let (_, client, admin, buyer, _creator, asset, material_id) =
+            prop_setup_with_price(&env, price, 500);
+
+        let purchase_id = client.purchase(
+            &buyer, &material_id, &asset, &price, &sample_transaction_id(&env),
+        );
+
+        // First refund succeeds.
+        client.refund_purchase(&admin, &purchase_id);
+
+        // Second refund must be deterministically rejected.
+        let second = client.try_refund_purchase(&admin, &purchase_id);
+        assert_eq!(
+            second,
+            Err(Ok(PurchaseError::RefundNotAllowed)),
+            "seed={seed}: expected RefundNotAllowed on second refund attempt"
+        );
+    });
+}
+
+// ── P5 + P6: fee arithmetic is sound across all valid fee rates & tiers ───
+#[test]
+fn property_p5_p6_fee_arithmetic_is_sound_for_all_tiers_and_prices() {
+    let tiers = [
+        (CreatorTier::Default, 500u32),  // 5 % platform fee
+        (CreatorTier::Tier1,   250u32),  // 2.5 %
+        (CreatorTier::Tier2,   150u32),  // 1.5 %
+    ];
+
+    for (tier, expected_fee_bps) in tiers {
+        prop_sweep(|seed| {
+            let env = Env::default();
+            let price: i128 = 100_000 + seed as i128 * 4_321;
+            // Initialize with fee=500; tier setting overrides for Tier1/Tier2.
+            let (_, client, admin, buyer, creator, asset, material_id) =
+                prop_setup_with_price(&env, price, 500);
+
+            if tier != CreatorTier::Default {
+                client.set_creator_tier(&admin, &creator, &tier);
+            }
+
+            let purchase_id = client.purchase(
+                &buyer, &material_id, &asset, &price, &sample_transaction_id(&env),
+            );
+
+            let escrow = client.get_escrow_record(&purchase_id).unwrap();
+
+            // P5: platform_fee ≥ 0.
+            assert!(
+                escrow.platform_fee >= 0,
+                "tier={tier:?} seed={seed}: platform_fee is negative"
+            );
+            // P5: platform_fee ≤ gross.
+            assert!(
+                escrow.platform_fee <= price,
+                "tier={tier:?} seed={seed}: platform_fee {} > gross {}",
+                escrow.platform_fee, price
+            );
+            // P6: seller_net + platform_fee == gross.
+            assert_eq!(
+                escrow.seller_net + escrow.platform_fee,
+                price,
+                "tier={tier:?} seed={seed}: money not conserved: \
+                 {0} + {1} ≠ {price}",
+                escrow.seller_net, escrow.platform_fee
+            );
+            // P5 exact: fee matches the tier's bps.
+            let expected_fee = (price * expected_fee_bps as i128) / 10_000;
+            assert_eq!(
+                escrow.platform_fee, expected_fee,
+                "tier={tier:?} seed={seed}: expected fee {expected_fee}, got {}",
+                escrow.platform_fee
+            );
+        });
+    }
+}
+
+// ── P7: purchase_id increments sequentially ───────────────────────────────
+#[test]
+fn property_p7_purchase_ids_are_sequential_and_unique() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin    = Address::generate(&env);
+    let registry = env.register(MockRegistry, ());
+    let treasury = Address::generate(&env);
+    let creator  = Address::generate(&env);
+    let asset    = env.register(MockAsset, ());
+
+    let (_, client) = install_and_init_contract(&env, &admin, &registry, &treasury, 500);
+    client.set_asset_allowed(&admin, &asset, &AssetKind::Token, &true);
+
+    // Register 16 distinct materials and purchase each with a fresh buyer.
+    let mut prev_id: Option<u64> = None;
+    for seq in 0u8..16 {
+        let buyer       = Address::generate(&env);
+        let material_id = bytes32(&env, 100u8.wrapping_add(seq));
+        let material = MaterialRecord {
+            material_id: material_id.clone(),
+            creator: creator.clone(),
+            paused: false,
+            status: MaterialStatus::Active,
+            quotes: soroban_sdk::vec![&env, AssetQuote { asset: asset.clone(), amount: 100_000 }],
+            payout_shares: soroban_sdk::vec![&env, PayoutShare { recipient: creator.clone(), share_bps: 10_000 }],
+        };
+        MockRegistryClient::new(&env, &registry).set_material(&material_id, &material);
+        MockRegistryClient::new(&env, &registry).set_material_immutable(
+            &material_id,
+            &MockImmutableSnapshot {
+                metadata_uri: soroban_sdk::String::from_str(&env, "ipfs://seq"),
+                metadata_hash: bytes32(&env, seq),
+                rights_hash:   bytes32(&env, seq.wrapping_add(1)),
+            },
+            &1,
+        );
+
+        let pid = client.purchase(
+            &buyer, &material_id, &asset, &100_000, &sample_transaction_id(&env),
+        );
+
+        if let Some(prev) = prev_id {
+            assert_eq!(
+                pid, prev + 1,
+                "seq={seq}: expected purchase_id {}, got {pid}", prev + 1
+            );
+        }
+        prev_id = Some(pid);
+    }
+}
+
+// ── P8: reconcile_entitlement is denied after refund ──────────────────────
+#[test]
+fn property_p8_reconcile_denied_after_refund_across_prices() {
+    prop_sweep(|seed| {
+        let env = Env::default();
+        let price: i128 = 10_000 + seed as i128 * 8_000;
+        let (_, client, admin, buyer, _creator, asset, material_id) =
+            prop_setup_with_price(&env, price, 500);
+
+        let purchase_id = client.purchase(
+            &buyer, &material_id, &asset, &price, &sample_transaction_id(&env),
+        );
+
+        // Before refund: reconcile_entitlement grants access.
+        assert!(
+            client.try_reconcile_entitlement(&material_id, &buyer).is_ok(),
+            "seed={seed}: expected access before refund"
+        );
+
+        client.refund_purchase(&admin, &purchase_id);
+
+        // After refund: reconcile_entitlement denies access.
+        assert!(
+            client.try_reconcile_entitlement(&material_id, &buyer).is_err(),
+            "seed={seed}: expected denial after refund"
+        );
+        // has_entitlement must also return false.
+        assert!(
+            !client.has_entitlement(&material_id, &buyer),
+            "seed={seed}: has_entitlement should be false after refund"
+        );
+    });
+}
+
+// ── P9: bulk recipient count is bounded at MAX + 1 ────────────────────────
+#[test]
+fn property_p9_bulk_purchase_rejects_over_max_recipients() {
+    let env = Env::default();
+    let (_, client, _admin, buyer, _creator, asset, material_id) =
+        prop_setup_with_price(&env, 100_000, 500);
+
+    // Build a recipient list that is exactly one over the documented limit.
+    let mut recipients = soroban_sdk::Vec::new(&env);
+    for _ in 0..=MAX_BULK_LICENSE_RECIPIENTS {  // MAX + 1 entries
+        recipients.push_back(Address::generate(&env));
+    }
+
+    let result = client.try_purchase_bulk_licenses(
+        &buyer, &material_id, &asset, &100_000, &sample_transaction_id(&env), &recipients,
+    );
+    assert_eq!(
+        result,
+        Err(Ok(PurchaseError::TooManyRecipients)),
+        "expected TooManyRecipients when recipients.len() == MAX + 1"
+    );
+}
+
+// ── P10: quote expiry enforced; fresh quote succeeds ──────────────────────
+#[test]
+fn property_p10_expired_quote_blocks_purchase_fresh_quote_allows_it() {
+    prop_sweep(|seed| {
+        let env = Env::default();
+        // Vary price so the quote record differs across seeds.
+        let price: i128 = 50_000 + seed as i128 * 2_000;
+        let (_, client, _admin, buyer, _creator, asset, material_id) =
+            prop_setup_with_price(&env, price, 500);
+
+        // Record a quote and immediately expire it.
+        client.record_quote(&buyer, &material_id, &asset);
+        let mut ledger = env.ledger().get();
+        ledger.timestamp += QUOTE_TTL_SECONDS + 1;
+        env.ledger().set(ledger);
+
+        let expired_result = client.try_purchase(
+            &buyer, &material_id, &asset, &price, &sample_transaction_id(&env),
+        );
+        assert_eq!(
+            expired_result,
+            Err(Ok(PurchaseError::QuoteExpired)),
+            "seed={seed}: expected QuoteExpired"
+        );
+
+        // Re-quoting must allow a fresh purchase.
+        client.record_quote(&buyer, &material_id, &asset);
+        client.purchase(&buyer, &material_id, &asset, &price, &sample_transaction_id(&env));
+        assert!(
+            client.has_entitlement(&material_id, &buyer),
+            "seed={seed}: fresh quote after expiry should allow purchase"
+        );
+    });
+}
+
+// ── P11: dispute window boundary ─────────────────────────────────────────
+#[test]
+fn property_p11_dispute_window_boundary_is_exact() {
+    // Test at three characteristic ledger positions relative to the window.
+    // - one ledger before the boundary: dispute must succeed.
+    // - exactly at the boundary: dispute must fail.
+    // - one ledger after the boundary: dispute must fail.
+    for offset in [u32::MAX, 0u32, 1u32] {
+        let env = Env::default();
+        let (_, client, _admin, buyer, _creator, asset, material_id) =
+            prop_setup_with_price(&env, 100_000, 500);
+
+        let purchase_id = client.purchase(
+            &buyer, &material_id, &asset, &100_000, &sample_transaction_id(&env),
+        );
+        let escrow = client.get_escrow_record(&purchase_id).unwrap();
+        let purchase_ledger = escrow.purchase_ledger;
+
+        let target_ledger = if offset == u32::MAX {
+            // One before boundary
+            purchase_ledger + 30_000 - 1
+        } else {
+            purchase_ledger + 30_000 + offset
+        };
+
+        env.ledger().set_sequence_number(target_ledger);
+        let reason = Bytes::from_array(&env, b"boundary dispute test");
+        let result = client.try_open_dispute(&buyer, &purchase_id, &reason);
+
+        if offset == u32::MAX {
+            // Within window: must succeed.
+            assert!(
+                result.is_ok(),
+                "offset=before_boundary: expected dispute to succeed, got {result:?}"
+            );
+        } else {
+            // At or after boundary: must be rejected.
+            assert_eq!(
+                result,
+                Err(Ok(PurchaseError::DisputeWindowExpired)),
+                "offset={offset}: expected DisputeWindowExpired"
+            );
+        }
+    }
+}
+
+// ── P12: partial bulk refund preserves untouched entitlements ─────────────
+#[test]
+fn property_p12_partial_bulk_refund_preserves_remaining_entitlements() {
+    // Sweep over batch sizes from 3 to a max of 10 (all within
+    // MAX_BULK_LICENSE_RECIPIENTS) and verify that a limit-1 batch refund
+    // leaves exactly one entitlement live.
+    for batch_size in 3u32..=10 {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin    = Address::generate(&env);
+        let registry = env.register(MockRegistry, ());
+        let treasury = Address::generate(&env);
+        let purchaser = Address::generate(&env);
+        let creator  = Address::generate(&env);
+        let asset    = env.register(MockAsset, ());
+
+        let material_id = bytes32(&env, 1);
+        let material = MaterialRecord {
+            material_id: material_id.clone(),
+            creator: creator.clone(),
+            paused: false,
+            status: MaterialStatus::Active,
+            quotes: soroban_sdk::vec![&env, AssetQuote { asset: asset.clone(), amount: 100_000 }],
+            payout_shares: soroban_sdk::vec![&env, PayoutShare { recipient: creator.clone(), share_bps: 10_000 }],
+        };
+        let reg_client = MockRegistryClient::new(&env, &registry);
+        reg_client.set_material(&material_id, &material);
+        reg_client.set_material_immutable(
+            &material_id,
+            &MockImmutableSnapshot {
+                metadata_uri: soroban_sdk::String::from_str(&env, "ipfs://bulk-prop"),
+                metadata_hash: bytes32(&env, 11),
+                rights_hash:   bytes32(&env, 22),
+            },
+            &1,
+        );
+
+        let (_, client) = install_and_init_contract(&env, &admin, &registry, &treasury, 500);
+        client.set_asset_allowed(&admin, &asset, &AssetKind::Token, &true);
+
+        let mut recipients = soroban_sdk::Vec::new(&env);
+        for _ in 0..batch_size {
+            recipients.push_back(Address::generate(&env));
+        }
+
+        let result = client.purchase_bulk_licenses(
+            &purchaser, &material_id, &asset, &100_000, &sample_transaction_id(&env), &recipients,
+        );
+
+        // Refund only (batch_size - 1) of the purchases.
+        let limit = batch_size - 1;
+        let refund_result = client.refund_bulk_purchase(&admin, &purchaser, &material_id, &limit);
+        assert_eq!(refund_result.refunded_count, limit,
+            "batch_size={batch_size}: expected {limit} refunds");
+
+        // Exactly one recipient must still hold their entitlement.
+        let still_entitled: u32 = (0..batch_size).filter(|i| {
+            let r = recipients.get_unchecked(*i);
+            client.has_entitlement(&material_id, &r)
+        }).count() as u32;
+        assert_eq!(
+            still_entitled, 1,
+            "batch_size={batch_size}: expected 1 remaining entitlement, \
+             found {still_entitled}"
+        );
+
+        // The corresponding settlement must still be Pending.
+        let first_pid = result.first_purchase_id;
+        let last_pid  = first_pid + (batch_size as u64 - 1);
+        let last_settlement = client.get_settlement(&last_pid).unwrap();
+        assert_eq!(
+            last_settlement.state, SettlementState::Pending,
+            "batch_size={batch_size}: last settlement should remain Pending"
+        );
     }
 }
