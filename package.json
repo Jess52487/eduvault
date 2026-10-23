@@ -40,6 +40,7 @@
     "monitor:synthetic": "node scripts/synthetic-monitor.mjs",
     "monitor:synthetic:dry": "node scripts/synthetic-monitor.mjs --dry-run",
     "verify:restore": "node scripts/verify-restore.mjs",
+    "verify:rollback": "node scripts/verify-rollback.mjs",
     "support:expire": "node scripts/expire-support-sessions.mjs",
     "health:check": "node scripts/check-dependency-health.mjs"
   },
