@@ -189,6 +189,11 @@ export async function PUT(request) {
         }
         const user = authorization.user;
 
+        // Keep update responses on the same negotiated schema contract as
+        // collection reads and creates. Storage is normalized to the latest
+        // shape; the response can still be downgraded for older clients.
+        const negotiation = negotiateSchemaVersion(request, "materials");
+
         const url = new URL(request.url);
         const materialId = url.searchParams.get("id");
         if (!materialId || !ObjectId.isValid(materialId)) {
@@ -246,8 +251,15 @@ export async function PUT(request) {
             now,
           })
           : undefined;
+        const latestShape = writeRecord("materials", { ...existing, ...updates });
         const updateDoc = {
           ...updates,
+          schemaVersion: latestShape.schemaVersion,
+          ...(latestShape.pricingTier !== undefined ? { pricingTier: latestShape.pricingTier } : {}),
+          ...(latestShape.sorobanEntitlementConfig !== undefined
+            ? { sorobanEntitlementConfig: latestShape.sorobanEntitlementConfig }
+            : {}),
+          ...(latestShape.rightsMetadata !== undefined ? { rightsMetadata: latestShape.rightsMetadata } : {}),
           ...(provenance ? { provenance } : {}),
           updatedAt: now,
           updatedBy: userAddress,
@@ -325,9 +337,15 @@ export async function PUT(request) {
         await invalidateCatalogCache();
 
         auditLog({ event: "material_updated", route: "materials", method: "PUT", status: 200, actor: user.sub, materialId });
-        return NextResponse.json(sanitizeMaterial(updatedMaterial));
+        const responseMaterial = readRecord("materials", sanitizeMaterial(updatedMaterial), {
+          targetVersion: negotiation.version,
+        });
+        return NextResponse.json(responseMaterial, { headers: schemaResponseHeaders("materials", negotiation.version) });
       } catch (err) {
         if (err.name === "ValidationError") throw err;
+        if (err instanceof UnsupportedSchemaVersionError) {
+          return NextResponse.json({ error: err.message, collection: err.collection, latest: err.latest }, { status: 400 });
+        }
         auditLog({ event: "material_update_failed", route: "materials", method: "PUT", status: 500, reason: err.message });
         return NextResponse.json({ error: "Server error" }, { status: 500 });
       }
