@@ -53,6 +53,11 @@ the requested version, stamps `schemaVersion`, and runs the target version's
 listings carry the current schema and the metadata it requires (for `materials`
 v2: `pricingTier`, `sorobanEntitlementConfig`, `rightsMetadata`).
 
+`PUT` and `PATCH /api/materials` normalize the stored document to the latest
+schema before applying an update, then downgrade the response to the requested
+client version. This keeps legacy clients compatible without allowing an older
+client write to remove fields introduced by a newer schema.
+
 ## API version negotiation
 
 Clients pin a shape with the request header:
