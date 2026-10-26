@@ -14,7 +14,7 @@
  *   1 — Release blocked or strict mode failure (BLOCKED)
  */
 
-import { writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import {
   evaluateReleaseReadiness,
   ReleaseDecision,
@@ -29,9 +29,31 @@ const outFile = args.find(a => a.startsWith('--out='))?.slice('--out='.length) |
 const actorId = args.find(a => a.startsWith('--actor='))?.slice('--actor='.length) || 'release-cli-operator';
 const actorRole = args.find(a => a.startsWith('--role='))?.slice('--role='.length) || 'deployer';
 const rawPermissions = args.find(a => a.startsWith('--permissions='))?.slice('--permissions='.length) || null;
+const evidenceFlag = args.findIndex(a => a === '--evidence');
+const commitFlag = args.findIndex(a => a === '--commit');
+const evidencePath = args.find(a => a.startsWith('--evidence='))?.slice('--evidence='.length)
+  || (evidenceFlag >= 0 ? args[evidenceFlag + 1] : null);
+const expectedCommit = args.find(a => a.startsWith('--commit='))?.slice('--commit='.length)
+  || (commitFlag >= 0 ? args[commitFlag + 1] : null);
 
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/eduvault';
 const MONGODB_DB = process.env.MONGODB_DB || 'eduvault';
+
+// Evidence mode is used by the release workflow. It is intentionally
+// dependency-free and checks the exact commit, migration proof, security
+// checks, smoke test, and rollback rehearsal recorded in the evidence file.
+if (evidencePath) {
+  const { evaluateReleaseReadiness: evaluateEvidence } = await import('../src/lib/release/readiness.js');
+  try {
+    const evidence = JSON.parse(readFileSync(evidencePath, 'utf8'));
+    const report = evaluateEvidence(evidence, { expectedCommit });
+    console.log(JSON.stringify(report, null, 2));
+    process.exit(report.ready ? 0 : 1);
+  } catch (error) {
+    console.error(`[release-readiness] Evidence check failed: ${error.message}`);
+    process.exit(1);
+  }
+}
 
 async function main() {
   console.log('\n  [release-readiness] ═══════════════════════════════════════');
