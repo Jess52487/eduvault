@@ -251,6 +251,7 @@ describe('Stale Session and Token Revocation (Issue #1006)', () => {
       assert.equal(result.sessionVersion, 1);
       const user = await usersCol.findOne({ _id: '507f1f77bcf86cd799439011' });
       assert.equal(user.sessionVersion, 1);
+      assert.equal(user.tokensValidAfter, undefined);
       assert.equal(isSessionRevoked({ sessionVersion: 1 }, user).revoked, false);
     });
 

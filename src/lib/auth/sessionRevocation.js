@@ -191,8 +191,6 @@ export async function revokeUserSessions(db, userId, options = {}) {
   const preserveCurrentSession = Boolean(preserveFamilyId);
   const userUpdate = {
     $set: {
-      tokensValidAfter: timestampIso,
-      sessionRevokedAt: timestampIso,
       updatedAt: timestampIso,
       lastSecurityEvent: {
         eventType,
@@ -202,7 +200,11 @@ export async function revokeUserSessions(db, userId, options = {}) {
       },
     },
   };
-  if (!preserveCurrentSession) userUpdate.$inc = { sessionVersion: 1 };
+  if (!preserveCurrentSession) {
+    userUpdate.$set.tokensValidAfter = timestampIso;
+    userUpdate.$set.sessionRevokedAt = timestampIso;
+    userUpdate.$inc = { sessionVersion: 1 };
+  }
 
   const updateResult = await usersCollection.findOneAndUpdate(
     userQuery,
